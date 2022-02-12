@@ -1,6 +1,7 @@
 import io
 import json
 import os
+import sys
 import tempfile
 import time
 from contextlib import contextmanager
@@ -40,7 +41,7 @@ from semgrep_agent.utils import print_git_log
 from semgrep_agent.utils import render_error
 
 os.environ["SEMGREP_USER_AGENT_APPEND"] = "(Agent)"
-semgrep_exec = sh.semgrep.bake(_ok_code={0, 1}, _tty_out=False)
+semgrep_exec = sh.semgrep.bake(_ok_code={0, 1}, _tty_out=False, _err=sys.stderr)
 
 SEMGREP_SAVE_FILE = LOG_FOLDER + "/semgrep_agent_output"
 SEMGREP_SAVE_FILE_BASELINE = LOG_FOLDER + "/semgrep_agent_output_baseline"
@@ -70,6 +71,10 @@ class RunContext:
     timeout: Optional[int]
     # The path to the semgrepignore file to be used by the Semgrep CLI
     action_ignores_path: str
+    # api key used by semgrep to download policy
+    api_key: Optional[str]
+    # used by semgrep to download policy
+    repo_name: Optional[str]
 
 
 @attr.s(auto_attribs=True, frozen=True)
@@ -240,10 +245,22 @@ def _get_findings(context: RunContext) -> Tuple[FindingSets, RunStats]:
         debug_echo("=== seeing if there are any findings")
 
         findings, stats = _get_head_findings(
-            context, [*config_args, *metrics_args, *rewrite_args], targets
+            context,
+            [*config_args, *metrics_args, *rewrite_args],
+            targets,
+            context.api_key,
+            context.repo_name,
         )
 
-    _update_baseline_findings(context, findings, local_configs, rewrite_args, targets)
+    _update_baseline_findings(
+        context,
+        findings,
+        local_configs,
+        rewrite_args,
+        targets,
+        context.api_key,
+        context.repo_name,
+    )
 
     if os.getenv("INPUT_GENERATESARIF"):
         click.echo("=== re-running scan to generate a SARIF report", err=True)
@@ -255,6 +272,8 @@ def _get_findings(context: RunContext) -> Tuple[FindingSets, RunStats]:
                 [str(p) for p in paths],
                 timeout=context.timeout,
                 explicit_semgrepignore_path=context.action_ignores_path,
+                api_key=context.api_key,
+                repo_name=context.repo_name,
             )
         rewrite_sarif_file(sarif_output, sarif_path)
 
@@ -262,7 +281,11 @@ def _get_findings(context: RunContext) -> Tuple[FindingSets, RunStats]:
 
 
 def _get_head_findings(
-    context: RunContext, extra_args: Sequence[str], targets: TargetFileManager
+    context: RunContext,
+    extra_args: Sequence[str],
+    targets: TargetFileManager,
+    api_key: Optional[str],
+    repo_name: Optional[str],
 ) -> Tuple[FindingSets, RunStats]:
     """
     Gets findings for the project's HEAD git commit
@@ -294,6 +317,8 @@ def _get_head_findings(
         exit_code, semgrep_output = invoke_semgrep(
             args,
             [str(p) for p in paths],
+            api_key=api_key,
+            repo_name=repo_name,
             timeout=context.timeout,
             explicit_semgrepignore_path=context.action_ignores_path,
         )
@@ -348,6 +373,8 @@ def _update_baseline_findings(
     local_configs: Set[str],
     extra_args: Sequence[str],
     targets: TargetFileManager,
+    api_key: Optional[str],
+    repo_name: Optional[str],
 ) -> None:
     """
     Updates findings.baseline with findings from the baseline git commit
@@ -417,6 +444,8 @@ def _update_baseline_findings(
                     _, semgrep_output = invoke_semgrep(
                         args,
                         paths_to_check,
+                        api_key=api_key,
+                        repo_name=repo_name,
                         timeout=context.timeout,
                         baseline=True,
                         explicit_semgrepignore_path=context.action_ignores_path,
@@ -454,6 +483,8 @@ class SemgrepOutput:
 def invoke_semgrep(
     semgrep_args: List[str],
     targets: List[str],
+    api_key: Optional[str],
+    repo_name: Optional[str],
     *,
     timeout: Optional[int],
     baseline: bool = False,
@@ -477,6 +508,9 @@ def invoke_semgrep(
         if explicit_semgrepignore_path
         else os.environ
     )
+    if api_key and repo_name:
+        _env["SEMGREP_LOGIN_TOKEN"] = api_key
+        _env["SEMGREP_REPO_NAME"] = repo_name
 
     semgrep_save_file_baseline = Path(SEMGREP_SAVE_FILE_BASELINE)
     if not baseline and semgrep_save_file_baseline.exists():
@@ -493,7 +527,6 @@ def invoke_semgrep(
     for chunk in chunked_iter(targets, PATHS_CHUNK_SIZE):
         with tempfile.NamedTemporaryFile("w") as output_json_file:
             args = semgrep_args.copy()
-            args.extend(["--debug"])
             args.extend(
                 [
                     "-o",
@@ -504,10 +537,10 @@ def invoke_semgrep(
                 args.append(c)
 
             debug_echo(f"== Invoking semgrep with { len(args) } args")
-
-            exit_code = semgrep_exec(
-                *args, _timeout=timeout, _err=debug_echo, _env=_env
-            ).exit_code
+            click.echo("== Running Semgrep", err=True)
+            click.echo("== --------------------------", err=True)
+            exit_code = semgrep_exec(*args, _timeout=timeout, _env=_env).exit_code
+            click.echo("== --------------------------", err=True)
             max_exit_code = max(max_exit_code, exit_code)
 
             debug_echo(f"== Semgrep finished with exit code { exit_code }")
@@ -540,6 +573,8 @@ def invoke_semgrep(
 def invoke_semgrep_sarif(
     semgrep_args: List[str],
     targets: List[str],
+    api_key: Optional[str],
+    repo_name: Optional[str],
     *,
     timeout: Optional[int],
     explicit_semgrepignore_path: Optional[str] = None,
@@ -560,11 +595,14 @@ def invoke_semgrep_sarif(
         if explicit_semgrepignore_path
         else os.environ
     )
+    if api_key and repo_name:
+        _env["SEMGREP_LOGIN_TOKEN"] = api_key
+        _env["SEMGREP_REPO_NAME"] = repo_name
 
     for chunk in chunked_iter(targets, PATHS_CHUNK_SIZE):
         with tempfile.NamedTemporaryFile("w") as output_json_file:
             args = semgrep_args.copy()
-            args.extend(["--debug", "--sarif"])
+            args.extend(["--sarif"])
             args.extend(
                 [
                     "-o",
@@ -574,9 +612,7 @@ def invoke_semgrep_sarif(
             for c in chunk:
                 args.append(c)
 
-            exit_code = semgrep_exec(
-                *args, _timeout=timeout, _err=debug_echo, _env=_env
-            ).exit_code
+            exit_code = semgrep_exec(*args, _timeout=timeout, _env=_env).exit_code
             max_exit_code = max(max_exit_code, exit_code)
 
             with open(
